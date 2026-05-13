@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id           String        @id @default(cuid())
+  username     String        @unique
+  password     String
+  displayName  String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  settings     Setting[]
+  transactions Transaction[]
+}
+
+model Transaction {
+  id           String   @id @default(cuid())
+  type         String
+  symbol       String
+  date         DateTime
+  price        Float
+  quantity     Float
+  commission   Float    @default(0)
+  notes        String?
+  exchangeRate Float    @default(0)
+  totalUSD     Float    @default(0)
+  totalTRY     Float    @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  userId       String?
+  user         User?    @relation(fields: [userId], references: [id])
+
+  @@index([symbol])
+  @@index([date])
+  @@index([type])
+  @@index([userId])
+}
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String
+  value     String
+  updatedAt DateTime @updatedAt
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@unique([key, userId])
+  @@index([userId])
+}
