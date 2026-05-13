@@ -22,7 +22,8 @@ export interface Position {
   symbol: string;
   totalQuantity: number;
   averageCost: number;
-  totalInvested: number;
+  totalInvested: number;          // Cost basis (includes DRIP) — for average cost
+  outOfPocketInvested: number;    // Actual cash invested (BUY only) — for return %
   lots: Lot[];
 }
 
@@ -31,7 +32,8 @@ export interface PositionDetail {
   quantity: number;
   averageCost: number;
   currentPrice: number;
-  totalInvested: number;
+  totalInvested: number;          // Cost basis (includes DRIP)
+  outOfPocketInvested: number;    // Actual cash invested (BUY only)
   currentValue: number;
   profitLoss: number;
   profitLossPct: number;
@@ -110,7 +112,34 @@ export function calculatePortfolioPositions(
     const { type, symbol, price, quantity, commission, totalUSD } = tx;
 
     switch (type) {
-      case 'BUY':
+      case 'BUY': {
+        const lot: Lot = {
+          date: tx.date,
+          quantity,
+          pricePerShare: price,
+          remainingQuantity: quantity,
+        };
+
+        if (!positions.has(symbol)) {
+          positions.set(symbol, {
+            symbol,
+            totalQuantity: 0,
+            averageCost: 0,
+            totalInvested: 0,
+            outOfPocketInvested: 0,
+            lots: [],
+          });
+        }
+
+        const pos = positions.get(symbol)!;
+        pos.lots.push(lot);
+        pos.totalQuantity = roundTo(pos.totalQuantity + quantity, PRECISION);
+        pos.totalInvested = roundTo(pos.totalInvested + totalUSD, PRECISION);
+        pos.outOfPocketInvested = roundTo(pos.outOfPocketInvested + totalUSD, PRECISION);
+        pos.averageCost = pos.totalQuantity > 0 ? roundTo(pos.totalInvested / pos.totalQuantity, PRECISION) : 0;
+        break;
+      }
+
       case 'DRIP': {
         const lot: Lot = {
           date: tx.date,
@@ -125,6 +154,7 @@ export function calculatePortfolioPositions(
             totalQuantity: 0,
             averageCost: 0,
             totalInvested: 0,
+            outOfPocketInvested: 0,
             lots: [],
           });
         }
@@ -132,7 +162,10 @@ export function calculatePortfolioPositions(
         const pos = positions.get(symbol)!;
         pos.lots.push(lot);
         pos.totalQuantity = roundTo(pos.totalQuantity + quantity, PRECISION);
+        // totalInvested includes DRIP for cost basis / average cost calculation
         pos.totalInvested = roundTo(pos.totalInvested + totalUSD, PRECISION);
+        // outOfPocketInvested does NOT include DRIP — DRIP is a dividend return, not new capital
+        // (outOfPocketInvested stays unchanged for DRIP)
         pos.averageCost = pos.totalQuantity > 0 ? roundTo(pos.totalInvested / pos.totalQuantity, PRECISION) : 0;
         break;
       }
@@ -157,13 +190,25 @@ export function calculatePortfolioPositions(
             // This lot can cover the entire sell
             lot.remainingQuantity = roundTo(lot.remainingQuantity - remainingSell, PRECISION);
             pos.totalQuantity = roundTo(pos.totalQuantity - remainingSell, PRECISION);
-            pos.totalInvested = roundTo(pos.totalInvested - roundTo(remainingSell * lot.pricePerShare, PRECISION), PRECISION);
+            const costOfSold = roundTo(remainingSell * lot.pricePerShare, PRECISION);
+            pos.totalInvested = roundTo(pos.totalInvested - costOfSold, PRECISION);
+            // Reduce outOfPocketInvested proportionally for the sold lot
+            // Only if this lot was from a BUY (DRIP lots don't contribute to outOfPocket)
+            if (lot.pricePerShare > 0 && pos.outOfPocketInvested > 0) {
+              const ratio = Math.min(1, costOfSold / pos.totalInvested || 0);
+              pos.outOfPocketInvested = roundTo(pos.outOfPocketInvested * (1 - ratio), PRECISION);
+            }
             remainingSell = 0;
           } else {
             // This lot is partially consumed
             const consumed = lot.remainingQuantity;
             pos.totalQuantity = roundTo(pos.totalQuantity - consumed, PRECISION);
-            pos.totalInvested = roundTo(pos.totalInvested - roundTo(consumed * lot.pricePerShare, PRECISION), PRECISION);
+            const costOfSold = roundTo(consumed * lot.pricePerShare, PRECISION);
+            pos.totalInvested = roundTo(pos.totalInvested - costOfSold, PRECISION);
+            if (lot.pricePerShare > 0 && pos.outOfPocketInvested > 0) {
+              const ratio = Math.min(1, costOfSold / pos.totalInvested || 0);
+              pos.outOfPocketInvested = roundTo(pos.outOfPocketInvested * (1 - ratio), PRECISION);
+            }
             remainingSell = roundTo(remainingSell - consumed, PRECISION);
             lot.remainingQuantity = 0;
           }
@@ -227,12 +272,19 @@ export function calculateBenchmarkPositions(
     }
 
     switch (type) {
-      case 'BUY':
-      case 'DRIP': {
+      case 'BUY': {
         // Benchmark buys equivalent USD amount
         const sharesBought = roundTo(totalUSD / benchmarkPrice, PRECISION);
         totalShares = roundTo(totalShares + sharesBought, PRECISION);
         totalInvested = roundTo(totalInvested + totalUSD, PRECISION);
+        break;
+      }
+
+      case 'DRIP': {
+        // DRIP: benchmark gets equivalent shares (dividend reinvested)
+        // but totalInvested is NOT increased — it's a dividend return, not new capital
+        const sharesBought = roundTo(totalUSD / benchmarkPrice, PRECISION);
+        totalShares = roundTo(totalShares + sharesBought, PRECISION);
         break;
       }
 
@@ -273,7 +325,7 @@ export function calculatePortfolioSummary(
   currentPrices: Record<string, number | null>,
   exchangeRate: number,
 ): PortfolioSummary {
-  let totalInvestedUSD = 0;
+  let totalInvestedUSD = 0;        // Out-of-pocket (BUY only) — for return %
   let currentValueUSD = 0;
   const positionDetails: PositionDetail[] = [];
 
@@ -281,12 +333,15 @@ export function calculatePortfolioSummary(
     if (pos.totalQuantity <= 0) continue; // Skip fully sold positions
 
     const currentPrice = currentPrices[symbol] ?? 0;
-    const totalInvested = pos.totalInvested;
+    const totalInvested = pos.totalInvested;                // Cost basis (includes DRIP)
+    const outOfPocketInvested = pos.outOfPocketInvested;    // Actual cash invested (BUY only)
     const currentValue = roundTo(pos.totalQuantity * currentPrice, PRECISION);
+    // Position-level P&L uses cost basis for accuracy
     const profitLoss = roundTo(currentValue - totalInvested, PRECISION);
     const profitLossPct = totalInvested > 0 ? roundTo((profitLoss / totalInvested) * 100, 2) : 0;
 
-    totalInvestedUSD = roundTo(totalInvestedUSD + totalInvested, PRECISION);
+    // Portfolio-level invested uses out-of-pocket only — DRIP is a return, not new capital
+    totalInvestedUSD = roundTo(totalInvestedUSD + outOfPocketInvested, PRECISION);
     currentValueUSD = roundTo(currentValueUSD + currentValue, PRECISION);
 
     positionDetails.push({
@@ -295,6 +350,7 @@ export function calculatePortfolioSummary(
       averageCost: pos.averageCost,
       currentPrice,
       totalInvested,
+      outOfPocketInvested,
       currentValue,
       profitLoss,
       profitLossPct,
@@ -397,8 +453,7 @@ export function generateTimeSeries(
 
       // Process transaction
       switch (tx.type) {
-        case 'BUY':
-        case 'DRIP': {
+        case 'BUY': {
           const lot: Lot = {
             date: tx.date,
             quantity: tx.quantity,
@@ -412,6 +467,7 @@ export function generateTimeSeries(
               totalQuantity: 0,
               averageCost: 0,
               totalInvested: 0,
+              outOfPocketInvested: 0,
               lots: [],
             });
           }
@@ -420,7 +476,9 @@ export function generateTimeSeries(
           pos.lots.push(lot);
           pos.totalQuantity = roundTo(pos.totalQuantity + tx.quantity, PRECISION);
           pos.totalInvested = roundTo(pos.totalInvested + tx.totalUSD, PRECISION);
+          pos.outOfPocketInvested = roundTo(pos.outOfPocketInvested + tx.totalUSD, PRECISION);
           pos.averageCost = pos.totalQuantity > 0 ? roundTo(pos.totalInvested / pos.totalQuantity, PRECISION) : 0;
+          // BUY: actual out-of-pocket investment
           cumulativeInvestedUSD = roundTo(cumulativeInvestedUSD + tx.totalUSD, PRECISION);
 
           // Benchmark buys equivalent amount
@@ -428,6 +486,46 @@ export function generateTimeSeries(
           if (benchPrice != null) {
             benchmarkShares = roundTo(benchmarkShares + tx.totalUSD / benchPrice, PRECISION);
             benchmarkTotalInvested = roundTo(benchmarkTotalInvested + tx.totalUSD, PRECISION);
+          }
+          break;
+        }
+
+        case 'DRIP': {
+          // DRIP: shares are added to portfolio but are NOT new capital investment.
+          // They are a dividend return being reinvested, so they should NOT inflate
+          // cumulativeInvestedUSD or benchmark totalInvested.
+          const lot: Lot = {
+            date: tx.date,
+            quantity: tx.quantity,
+            pricePerShare: tx.price,
+            remainingQuantity: tx.quantity,
+          };
+
+          if (!positions.has(tx.symbol)) {
+            positions.set(tx.symbol, {
+              symbol: tx.symbol,
+              totalQuantity: 0,
+              averageCost: 0,
+              totalInvested: 0,
+              outOfPocketInvested: 0,
+              lots: [],
+            });
+          }
+
+          const pos = positions.get(tx.symbol)!;
+          pos.lots.push(lot);
+          pos.totalQuantity = roundTo(pos.totalQuantity + tx.quantity, PRECISION);
+          pos.totalInvested = roundTo(pos.totalInvested + tx.totalUSD, PRECISION);
+          // outOfPocketInvested: NOT increased for DRIP — it's a dividend return, not new capital
+          pos.averageCost = pos.totalQuantity > 0 ? roundTo(pos.totalInvested / pos.totalQuantity, PRECISION) : 0;
+          // DRIP: NOT added to cumulativeInvestedUSD — it's a dividend, not new capital
+
+          // Benchmark gets equivalent DRIP shares too (dividend reinvested)
+          // but totalInvested stays the same — it's a dividend return, not new investment
+          const benchPrice = findNearestPrice(benchmarkPrices, txDateStr);
+          if (benchPrice != null) {
+            benchmarkShares = roundTo(benchmarkShares + tx.totalUSD / benchPrice, PRECISION);
+            // DRIP: NOT added to benchmark totalInvested
           }
           break;
         }
@@ -597,8 +695,7 @@ export function generateMultiBenchmarkTimeSeries(
       if (txDateStr > dateStr) break;
 
       switch (tx.type) {
-        case 'BUY':
-        case 'DRIP': {
+        case 'BUY': {
           const lot: Lot = {
             date: tx.date,
             quantity: tx.quantity,
@@ -607,14 +704,16 @@ export function generateMultiBenchmarkTimeSeries(
           };
 
           if (!positions.has(tx.symbol)) {
-            positions.set(tx.symbol, { symbol: tx.symbol, totalQuantity: 0, averageCost: 0, totalInvested: 0, lots: [] });
+            positions.set(tx.symbol, { symbol: tx.symbol, totalQuantity: 0, averageCost: 0, totalInvested: 0, outOfPocketInvested: 0, lots: [] });
           }
 
           const pos = positions.get(tx.symbol)!;
           pos.lots.push(lot);
           pos.totalQuantity = roundTo(pos.totalQuantity + tx.quantity, PRECISION);
           pos.totalInvested = roundTo(pos.totalInvested + tx.totalUSD, PRECISION);
+          pos.outOfPocketInvested = roundTo(pos.outOfPocketInvested + tx.totalUSD, PRECISION);
           pos.averageCost = pos.totalQuantity > 0 ? roundTo(pos.totalInvested / pos.totalQuantity, PRECISION) : 0;
+          // BUY: actual out-of-pocket investment
           cumulativeInvestedUSD = roundTo(cumulativeInvestedUSD + tx.totalUSD, PRECISION);
 
           // Each benchmark buys equivalent amount
@@ -624,6 +723,42 @@ export function generateMultiBenchmarkTimeSeries(
             if (benchPrice != null) {
               benchmarkStates[bs].shares = roundTo(benchmarkStates[bs].shares + tx.totalUSD / benchPrice, PRECISION);
               benchmarkStates[bs].totalInvested = roundTo(benchmarkStates[bs].totalInvested + tx.totalUSD, PRECISION);
+            }
+          }
+          break;
+        }
+
+        case 'DRIP': {
+          // DRIP: shares are added to portfolio but are NOT new capital investment.
+          // They are a dividend return being reinvested, so they should NOT inflate
+          // cumulativeInvestedUSD or benchmark totalInvested.
+          const lot: Lot = {
+            date: tx.date,
+            quantity: tx.quantity,
+            pricePerShare: tx.price,
+            remainingQuantity: tx.quantity,
+          };
+
+          if (!positions.has(tx.symbol)) {
+            positions.set(tx.symbol, { symbol: tx.symbol, totalQuantity: 0, averageCost: 0, totalInvested: 0, outOfPocketInvested: 0, lots: [] });
+          }
+
+          const pos = positions.get(tx.symbol)!;
+          pos.lots.push(lot);
+          pos.totalQuantity = roundTo(pos.totalQuantity + tx.quantity, PRECISION);
+          pos.totalInvested = roundTo(pos.totalInvested + tx.totalUSD, PRECISION);
+          // outOfPocketInvested: NOT increased for DRIP — it's a dividend return, not new capital
+          pos.averageCost = pos.totalQuantity > 0 ? roundTo(pos.totalInvested / pos.totalQuantity, PRECISION) : 0;
+          // DRIP: NOT added to cumulativeInvestedUSD — it's a dividend, not new capital
+
+          // Each benchmark gets equivalent DRIP shares too (dividend reinvested)
+          // but totalInvested stays the same — it's a dividend return, not new investment
+          for (const bs of benchmarkSymbols) {
+            const bsPrices = allHistoricalPrices[bs] || {};
+            const benchPrice = findNearestPrice(bsPrices, txDateStr);
+            if (benchPrice != null) {
+              benchmarkStates[bs].shares = roundTo(benchmarkStates[bs].shares + tx.totalUSD / benchPrice, PRECISION);
+              // DRIP: NOT added to benchmark totalInvested — it's a dividend, not new capital
             }
           }
           break;

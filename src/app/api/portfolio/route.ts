@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { getCurrentPrice, getExchangeRate, getHistoricalPrices, setForceRefresh, isForceRefresh } from '@/lib/yahoo-finance';
+import { getCurrentPrice, getExchangeRate, getHistoricalPrices, setForceRefresh } from '@/lib/yahoo-finance';
 import {
   calculatePortfolioPositions,
   calculateBenchmarkPositions,

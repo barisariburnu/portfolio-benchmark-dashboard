@@ -52,6 +52,7 @@ interface PositionDetail {
   averageCost: number;
   currentPrice: number;
   totalInvested: number;
+  outOfPocketInvested: number;
   currentValue: number;
   profitLoss: number;
   profitLossPct: number;
